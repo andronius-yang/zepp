@@ -1,0 +1,92 @@
+//===- op_registry.cu --------------------------------------------- C++ ---===//
+// Copyright 2025 ByteDance Ltd. and/or its affiliates. All rights reserved.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+//===----------------------------------------------------------------------===//
+
+#include "flux/gemm_hparams.h"
+#include "flux/op_registry_proto_utils.h"
+#include "flux/flux.h"
+#include "flux/utils.h"
+#include "flux/op_registry.h"
+#include <mutex>
+
+namespace bytedance {
+namespace flux {
+
+namespace {
+std::once_flag init_flag;
+ArchEnum arch;
+SMCoreEnum sm_core;
+
+void
+init_device_properties() {
+  int major, minor;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
+  int arch_num = major * 10 + minor;
+  FLUX_CHECK(arch_num == 80 || arch_num == 89 || arch_num == 90)
+      << "unsupported arch: " << arch_num;
+  arch = ArchEnum{arch_num};
+
+  int sm_count;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+
+  switch (sm_count) {
+    case 92: sm_core = SMCoreEnum::L20; break;
+    case 108: sm_core = SMCoreEnum::A100; break;
+    case 78: sm_core = SMCoreEnum::H20; break;
+    case 132: sm_core = SMCoreEnum::H800; break;
+    default: FLUX_CHECK(false) << "Unsupported SM count for SMCoreEnum: " << sm_count; break;
+  }
+}
+}  // namespace
+
+ArchEnum
+get_arch() {
+  std::call_once(init_flag, init_device_properties);
+  return arch;
+}
+
+SMCoreEnum
+get_sm_core() {
+  std::call_once(init_flag, init_device_properties);
+  return sm_core;
+}
+
+TuningConfigRegistry &
+TuningConfigRegistry::instance() {
+  static TuningConfigRegistry inst;
+  return inst;
+}
+
+OpRegistry &
+OpRegistry::instance() {
+  static OpRegistry inst;
+  return inst;
+}
+
+bool
+OpRegistry::check_heuristic_rule(
+    const UnifiedGemmMeta &meta, const UnifiedGemmHParams &hparams, const RuntimeConfig &rt_conf) {
+  if (meta.impl() == _GemmV3{}) {
+    if (rt_conf.m() < 2048) {
+      auto const &v3_hparams = std::get<unified_type_t<GemmV3HParams>>(hparams.impl_spec());
+      return cute::get<0>(v3_hparams.cluster_shape()) == 1;
+    }
+  }
+  return true;
+}
+
+}  // namespace flux
+}  // namespace bytedance

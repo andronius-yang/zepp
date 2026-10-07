@@ -1,0 +1,16 @@
+{
+  "description": "LiveCodeBench (execution subset) expert-routing traces, one MoE layer, decode tokens only. One row = the top-k expert ids of one token. Rows are in prompt order, then token order.",
+  "layer": 5,
+  "topk": 8,
+  "windows": {
+    "eval": {"decode_slots": [64, 96], "use": "tokens the benchmark samples its batches from"},
+    "pool": {"decode_slots": [32, 64], "use": "load histogram the placement is planned from (the preceding window)"}
+  },
+  "models": {
+    "qwen3": {"trace_model": "Qwen3-235B", "num_experts": 128, "prompts": 479, "rows": 15328,
+              "pool_sha": "17cdb0b644c7bf83e9841bfbc30d3f90c8ba5129c649ca7eb59a1a609109917a"},
+    "k2":    {"trace_model": "Kimi-K2", "num_experts": 384, "prompts": 479, "rows": 15264,
+              "pool_sha": "46771998feca81816193707326e9cb60865d0a4a972738fb859a8eba80c6886c"}
+  },
+  "pool_sha_note": "sha256 fingerprint of the full per-prompt trace set the slices were extracted from; it seeds the batch sampler so that benchmark batches are reproducible bit-for-bit."
+}

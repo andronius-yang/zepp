@@ -1,0 +1,10 @@
+Zepp
+
+This software contains code derived from Flux
+(https://github.com/bytedance/flux), Copyright ByteDance Ltd. and/or its
+affiliates, licensed under the Apache License, Version 2.0.  The fused
+grouped-GEMM kernels, the NVSHMEM symmetric-memory bootstrap and the build
+skeleton in src/ originate there and were modified for this project.
+
+Flux itself includes derived work from CUTLASS (NVIDIA CORPORATION &
+AFFILIATES, BSD-3-Clause), vendored here as the 3rdparty/cutlass submodule.
