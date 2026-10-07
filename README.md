@@ -23,6 +23,7 @@ examples        usage examples
 tests           unit tests
 scripts         benchmark sweep
 env             example environment
+integrations    SGLang integration
 ```
 
 ## Build
@@ -72,6 +73,10 @@ y = layer.forward(x, plan)                            # dispatch_gemm -> activat
 
 `sizing_routing` is a representative batch the buffer capacities are derived from; `pool_routing` is
 the routing window the placement is planned from.
+
+## SGLang
+
+`integrations/sglang` runs the layer as an MoE backend of SGLang; see `integrations/sglang/README.md`.
 
 ## License
 

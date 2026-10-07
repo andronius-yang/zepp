@@ -1,0 +1,221 @@
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index cbaa0d0..0a65503 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -674,8 +674,10 @@ def _set_envs_and_config(server_args: ServerArgs):
+     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+     if not server_args.enable_symm_mem:
+         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
++    # zepp: its fused wire and swap lane are tuned for 24 device connections (the launcher sets it);
++    # keep a preset value instead of forcing 4, which deadlocks stream memory-operation waits.
++    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "4")
++    os.environ.setdefault("CUDA_MODULE_LOADING", "AUTO")
+     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+         os.environ["TRTLLM_ENABLE_PDL"] = "1"
+diff --git a/python/sglang/srt/eplb/expert_distribution.py b/python/sglang/srt/eplb/expert_distribution.py
+index 3faf981..a4d59ff 100644
+--- a/python/sglang/srt/eplb/expert_distribution.py
++++ b/python/sglang/srt/eplb/expert_distribution.py
+@@ -364,7 +364,8 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
+             (
+                 expert_location_metadata.num_layers,
+                 # TODO determine the max number
+-                server_args.chunked_prefill_size * 8,
++                # under DP attention the MoE sees the gathered batch of every DP rank
++                server_args.chunked_prefill_size * 8 * max(1, server_args.dp_size),
+                 self._TOP_K_NUM,
+             ),
+             dtype=torch.int32,
+diff --git a/python/sglang/srt/layers/moe/ep_moe/layer.py b/python/sglang/srt/layers/moe/ep_moe/layer.py
+index 76f48bc..adce03b 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/layer.py
++++ b/python/sglang/srt/layers/moe/ep_moe/layer.py
+@@ -962,6 +962,10 @@ class DeepEPMoE(EPMoE):
+ 
+ 
+ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
++    if get_moe_a2a_backend().is_zepp():
++        from zepp_sglang.layer import ZeppFusedMoE
++
++        return ZeppFusedMoE
+     if get_moe_a2a_backend().is_deepep():
+         return DeepEPMoE
+ 
+diff --git a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+index a70d1be..dca7ea3 100644
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
+ 
+     NONE = "none"
+     DEEPEP = "deepep"
++    ZEPP = "zepp"  # zepp: expert-parallel MoE layer with fused dispatch/combine (external package)
+ 
+     @classmethod
+     def _missing_(cls, value):
+@@ -40,6 +41,9 @@ class MoeA2ABackend(Enum):
+     def is_deepep(self):
+         return self == MoeA2ABackend.DEEPEP
+ 
++    def is_zepp(self):
++        return self == MoeA2ABackend.ZEPP
++
+ 
+ class MoeRunnerBackend(Enum):
+ 
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 32733c2..c1a1cd7 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1274,6 +1274,7 @@ class ExpertDistributionReqType(Enum):
+     DUMP_RECORD = 3
+ 
+ 
++@dataclass
+ class ExpertDistributionReq(BaseReq):
+     action: ExpertDistributionReqType
+ 
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 475305a..d8ace7f 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -253,9 +253,41 @@ class TpModelWorker:
+             )
+ 
+         if self.pp_group.is_last_rank:
+-            logits_output, can_run_cuda_graph = self.model_runner.forward(
+-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+-            )
++            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
++
++            run_forward = run_forward_sample = None
++            if get_moe_a2a_backend().is_zepp():
++                # zepp: the buffer verdict of every MoE layer is read once, before the sampled ids are used; a
++                # forward that exceeded the buffers runs again after they grew (a zepp_sglang without the hooks:
++                # the stock forward). run_forward_sample may enqueue the sampling before it waits for the verdict.
++                from zepp_sglang import runtime as zepp_runtime
++
++                run_forward = getattr(zepp_runtime, "run_forward", None)
++                run_forward_sample = getattr(zepp_runtime, "run_forward_sample", None)
++            if run_forward_sample is not None and not (
++                is_verify or model_worker_batch.is_prefill_only
++            ):
++                (logits_output, can_run_cuda_graph), next_token_ids = run_forward_sample(
++                    self.model_runner,
++                    forward_batch,
++                    pp_proxy_tensors,
++                    lambda lo: self.model_runner.sample(lo, forward_batch),
++                )
++                if launch_done is not None:
++                    launch_done.set()
++                return ForwardBatchOutput(
++                    logits_output=logits_output,
++                    next_token_ids=next_token_ids,
++                    can_run_cuda_graph=can_run_cuda_graph,
++                )
++            if run_forward is not None:
++                logits_output, can_run_cuda_graph = run_forward(
++                    self.model_runner, forward_batch, pp_proxy_tensors
++                )
++            else:
++                logits_output, can_run_cuda_graph = self.model_runner.forward(
++                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
++                )
+             if launch_done is not None:
+                 launch_done.set()
+ 
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index c484241..67084fb 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -121,7 +121,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+             prefix=add_prefix("gate", prefix),
+         )
+ 
+-        if get_moe_a2a_backend().is_deepep():
++        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_zepp():
+             # TODO: we will support tp < ep in the future
+             self.ep_size = get_moe_expert_parallel_world_size()
+             self.num_experts = (
+@@ -137,6 +137,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+         use_reduce_scatter: bool = False,
+     ) -> torch.Tensor:
+ 
++        if get_moe_a2a_backend().is_zepp():
++            return self.forward_zepp(hidden_states, forward_batch)
+         if not get_moe_a2a_backend().is_deepep():
+             return self.forward_normal(
+                 hidden_states, should_allreduce_fusion, use_reduce_scatter
+@@ -144,6 +146,33 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+         else:
+             return self.forward_deepep(hidden_states, forward_batch)
+ 
++    def forward_zepp(
++        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
++    ) -> torch.Tensor:
++        # zepp: the layer receives this rank's tokens only (scattered MLP mode) and owns the
++        # all-to-all; top-k ids stay LOGICAL (no expert-location dispatch), the layer maps them
++        # to its own replica placement. No all-reduce afterwards.
++        if hidden_states.shape[0] > 0:
++            router_logits, _ = self.gate(hidden_states)
++            topk_weights, topk_idx, _ = self.topk(
++                hidden_states,
++                router_logits,
++                num_token_non_padded=forward_batch.num_token_non_padded,
++            )
++        else:
++            topk_idx = torch.full(
++                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
++            )
++            topk_weights = torch.empty(
++                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
++            )
++        return self.experts(
++            hidden_states=hidden_states,
++            topk_idx=topk_idx,
++            topk_weights=topk_weights,
++            forward_batch=forward_batch,
++        )
++
+     def get_moe_weights(self):
+         return [
+             x.data
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index b27afcd..9d9be5d 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -312,7 +312,7 @@ class ServerArgs:
+ 
+     # Expert parallelism
+     ep_size: int = 1
+-    moe_a2a_backend: Literal["none", "deepep"] = "none"
++    moe_a2a_backend: Literal["none", "deepep", "zepp"] = "none"
+     moe_runner_backend: Literal[
+         "auto",
+         "triton",
+@@ -984,6 +984,13 @@ class ServerArgs:
+             )
+ 
+     def _handle_deepep_moe(self):
++        if self.moe_a2a_backend == "zepp":
++            # zepp drives each MoE layer-step from the host (per-layer CUDA graphs or eager): no model-level graphs
++            self.disable_cuda_graph = True
++            self.ep_size = self.tp_size
++            logger.warning(
++                f"zepp MoE is enabled. CUDA graphs are disabled and the expert parallel size is set to the tensor parallel size[{self.tp_size}]."
++            )
+         if self.moe_a2a_backend == "deepep":
+             if self.deepep_mode == "normal":
+                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+@@ -2158,7 +2165,7 @@ class ServerArgs:
+         parser.add_argument(
+             "--moe-a2a-backend",
+             type=str,
+-            choices=["none", "deepep"],
++            choices=["none", "deepep", "zepp"],
+             default=ServerArgs.moe_a2a_backend,
+             help="Choose the backend for MoE A2A.",
+         )

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zepp_sglang"
+version = "0.1.0"
+description = "SGLang adapter for the zepp expert-parallel MoE layer (backend 'zepp')"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["zepp_sglang"]
+package-dir = {"zepp_sglang" = "."}
